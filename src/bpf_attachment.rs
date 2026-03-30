@@ -1,15 +1,29 @@
 // SPDX-FileCopyrightText: 2026 The bpftop Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use libbpf_rs::query::{
-    CgroupLinkInfo, KprobeMultiLinkInfo, LinkInfo, LinkInfoIter, LinkTypeInfo::*, NetNsLinkInfo,
-    NetfilterLinkInfo, NetkitLinkInfo, RawTracepointLinkInfo, SockMapLinkInfo, StructOpsLinkInfo,
-    TcxLinkInfo, TracingLinkInfo, UprobeMultiLinkInfo, XdpLinkInfo,
+use anyhow::Result;
+use libbpf_rs::{
+    query::{
+        CgroupLinkInfo, KprobeMultiLinkInfo, LinkInfo, LinkInfoIter, LinkTypeInfo::*,
+        NetNsLinkInfo, NetfilterLinkInfo, NetkitLinkInfo, RawTracepointLinkInfo, SockMapLinkInfo,
+        StructOpsLinkInfo, TcxLinkInfo, TracingLinkInfo, UprobeMultiLinkInfo, XdpLinkInfo,
+    },
+    ProgramType,
 };
+use netlink_packet_core::{
+    NetlinkHeader, NetlinkMessage, NetlinkPayload, NetlinkSerializable, NLM_F_DUMP,
+    NLM_F_MULTIPART, NLM_F_REQUEST,
+};
+use netlink_packet_route::{
+    link::{LinkAttribute, LinkMessage},
+    tc::{TcAttribute, TcBpfFlags, TcFilterBpfOption, TcHandle, TcMessage, TcOption},
+    AddressFamily, RouteNetlinkMessage,
+};
+use netlink_sys::{protocols::NETLINK_ROUTE, Socket, SocketAddr};
 use nix::net::if_::if_indextoname;
 use ratatui::{style::Stylize as _, text::Line, widgets::ListItem};
 
-use crate::helpers::{attach_type_as_str, link_type_as_str};
+use crate::helpers::{attach_type_as_str, link_type_as_str, program_type_as_str};
 
 /// Collect and render all attachments used by the BPF program as a list of [`ListItem`]:
 ///
@@ -21,13 +35,33 @@ use crate::helpers::{attach_type_as_str, link_type_as_str};
 ///   <iface>(<ifindex>)  <direction>  [direct-action]
 ///   ...
 /// ```
-pub(crate) fn render_prog_attachments<'a>(prog_id: u32) -> Vec<ListItem<'a>> {
+pub(crate) fn render_prog_attachments<'a>(
+    prog_id: u32,
+    prog_type: &str,
+    sock: &mut Option<Socket>,
+) -> Vec<ListItem<'a>> {
     // Collect BPF links
     let links = LinkInfoIter::default()
         .filter_map(move |link| (link.prog_id == prog_id).then_some(link))
         .collect::<Vec<_>>();
 
-    let mut attachments = Vec::with_capacity(1 + links.len());
+    // Collect TC filters only if relevant
+    const SCHED_CLS: &str = program_type_as_str(&ProgramType::SchedCls);
+    const SCHED_ACT: &str = program_type_as_str(&ProgramType::SchedAct);
+    let tc_filters = match prog_type {
+        SCHED_CLS | SCHED_ACT => {
+            if sock.is_none() {
+                *sock = open_route_sock().ok();
+            }
+            match sock {
+                Some(route_sock) => prog_tc_filters(route_sock, prog_id).unwrap_or_default(),
+                None => vec![],
+            }
+        }
+        _ => vec![],
+    };
+
+    let mut attachments = Vec::with_capacity(2 + links.len() + tc_filters.len());
     if !links.is_empty() {
         attachments.push(ListItem::new(Line::from_iter([
             "BPF Links".bold(),
@@ -36,6 +70,16 @@ pub(crate) fn render_prog_attachments<'a>(prog_id: u32) -> Vec<ListItem<'a>> {
 
         for link in links {
             attachments.push(ListItem::new(render_bpf_link(link)));
+        }
+    }
+    if !tc_filters.is_empty() {
+        attachments.push(ListItem::new(Line::from_iter([
+            "TC Filters".bold(),
+            format!(" ({})", tc_filters.len()).into(),
+        ])));
+
+        for filter in tc_filters {
+            attachments.push(ListItem::new(render_tc_filter(filter)));
         }
     }
 
@@ -176,4 +220,199 @@ fn render_bpf_link<'a>(link: LinkInfo) -> Line<'a> {
         format!("  ID {}: {}", link.id, link_type).bold(),
         metadata.into(),
     ])
+}
+
+/// Render the TC filter info as a [`Line`]: `  <iface>(<ifindex>) <direction> [is-direct-action]`
+fn render_tc_filter<'a>(filter: TcFilter) -> Line<'a> {
+    let TcFilter {
+        ifindex,
+        ifname,
+        direction,
+        direct_action,
+    } = filter;
+
+    let direction_str = match direction {
+        Direction::Ingress => "Ingress",
+        Direction::Egress => "Egress",
+    };
+    let direct_act = if direct_action { "DirectAction" } else { "" };
+
+    Line::from_iter([
+        format!("  {}({})", ifname, ifindex).bold(),
+        format!(" {} {}", direction_str, direct_act).into(),
+    ])
+}
+
+/// TC BPF programs attached as TC filter on a clsact qdisc.
+struct TcFilter {
+    ifindex: i32,
+    ifname: String,
+    direction: Direction,
+    direct_action: bool,
+}
+
+/// TC filter traffic direction.
+#[derive(Clone, Copy)]
+enum Direction {
+    Ingress,
+    Egress,
+}
+
+fn open_route_sock() -> Result<Socket> {
+    let mut sock = Socket::new(NETLINK_ROUTE)?;
+    sock.bind_auto()?;
+    sock.connect(&SocketAddr::new(0, 0))?;
+    Ok(sock)
+}
+
+// Collect TC filters used by prog.
+fn prog_tc_filters(sock: &Socket, prog_id: u32) -> Result<Vec<TcFilter>> {
+    let ifaces = get_ifaces(sock)?;
+
+    const HANDLES: [(TcHandle, Direction); 2] = [
+        (
+            TcHandle {
+                major: u16::MAX,
+                minor: TcHandle::MIN_INGRESS,
+            },
+            Direction::Ingress,
+        ),
+        (
+            TcHandle {
+                major: u16::MAX,
+                minor: TcHandle::MIN_EGRESS,
+            },
+            Direction::Egress,
+        ),
+    ];
+
+    let mut tc_filters = vec![];
+
+    for (ifindex, ifname) in ifaces {
+        for (handle, direction) in HANDLES {
+            let mut tcmsg = TcMessage::default();
+            tcmsg.header.family = AddressFamily::Unspec;
+            tcmsg.header.index = ifindex;
+            tcmsg.header.parent = handle;
+
+            let mut pkt = NetlinkMessage::new(
+                NetlinkHeader::default(),
+                NetlinkPayload::from(RouteNetlinkMessage::GetTrafficFilter(tcmsg)),
+            );
+            pkt.header.flags = NLM_F_DUMP | NLM_F_REQUEST;
+            pkt.header.sequence_number = 1;
+            pkt.finalize();
+
+            let rx_tc_filters = send_and_recv(sock, pkt)?.into_iter().filter_map(|rtm| {
+                let RouteNetlinkMessage::NewTrafficFilter(rx_tcmsg) = rtm else {
+                    return None;
+                };
+                if !rx_tcmsg.attributes.iter().any(|attr| matches!(attr, TcAttribute::Kind(k) if k == "bpf")) {
+                    return None;
+                }
+
+                // Only collect filters used by prog
+                let Some(tc_opts) = rx_tcmsg.attributes.into_iter().find_map(|attr| match attr {
+                    TcAttribute::Options(tc_opts)
+                        if tc_opts.iter().any(|opt| matches!(
+                            opt,
+                            TcOption::Bpf(TcFilterBpfOption::ProgId(id)) if &prog_id == id
+                        )) =>
+                    {
+                        Some(tc_opts)
+                    },
+                    _ => None,
+                }) else {
+                    return None;
+                };
+
+                let direct_action = tc_opts.iter().any(|opt| matches!(
+                    opt,
+                    TcOption::Bpf(TcFilterBpfOption::Flags(f)) if f.contains(TcBpfFlags::DirectAction)
+                ));
+
+                Some(TcFilter { ifindex, ifname: ifname.clone(), direction, direct_action })
+            });
+
+            tc_filters.extend(rx_tc_filters);
+        }
+    }
+
+    Ok(tc_filters)
+}
+
+// Collect network interfaces as: (ifindex, ifname)
+fn get_ifaces(sock: &Socket) -> Result<impl Iterator<Item = (i32, String)>> {
+    let mut pkt = NetlinkMessage::new(
+        NetlinkHeader::default(),
+        NetlinkPayload::from(RouteNetlinkMessage::GetLink(LinkMessage::default())),
+    );
+    pkt.header.flags = NLM_F_DUMP | NLM_F_REQUEST;
+    pkt.header.sequence_number = 1;
+    pkt.finalize();
+
+    let ifaces = send_and_recv(&sock, pkt)?
+        .into_iter()
+        .filter_map(|rtm_msg| match rtm_msg {
+            RouteNetlinkMessage::NewLink(link_msg) => {
+                let ifindex = link_msg.header.index as i32;
+                let ifname = link_msg
+                    .attributes
+                    .into_iter()
+                    .find_map(|attr| match attr {
+                        LinkAttribute::IfName(name) => Some(name),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                Some((ifindex, ifname))
+            }
+            _ => None,
+        });
+    Ok(ifaces)
+}
+
+// Send and receive netlink packet.
+fn send_and_recv<I>(sock: &Socket, pkt: NetlinkMessage<I>) -> Result<Vec<RouteNetlinkMessage>>
+where
+    I: NetlinkSerializable,
+{
+    let mut send_buf = vec![0; pkt.header.length as usize];
+    pkt.serialize(&mut send_buf[..]);
+    sock.send(&send_buf[..], 0)?;
+
+    let mut rx_buf = [0; 8192];
+    let mut rx_dump = vec![];
+
+    // NLM_F_DUMP flag expect a multipart rx_pkt in response.
+    let mut dump_done = false;
+    let mut multipart = true;
+    while !dump_done && multipart {
+        multipart = false;
+        let size = sock.recv(&mut &mut rx_buf[..], 0)?;
+
+        let mut offset = 0;
+        while offset < size {
+            let rx_pkt: NetlinkMessage<RouteNetlinkMessage> =
+                NetlinkMessage::deserialize(&rx_buf[offset..])?;
+            multipart = rx_pkt.header.flags & NLM_F_MULTIPART != 0;
+            if rx_pkt.header.length == 0 {
+                break;
+            }
+
+            match rx_pkt.payload {
+                NetlinkPayload::Done(_) => {
+                    dump_done = true;
+                    break;
+                }
+                NetlinkPayload::InnerMessage(msg) => {
+                    rx_dump.push(msg);
+                }
+                _ => {}
+            }
+
+            offset += rx_pkt.header.length as usize;
+        }
+    }
+
+    Ok(rx_dump)
 }

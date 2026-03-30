@@ -22,6 +22,7 @@ use crate::{
 };
 use circular_buffer::CircularBuffer;
 use libbpf_rs::{query::ProgInfoIter, Iter, Link};
+use netlink_sys::Socket;
 use ratatui::widgets::ScrollbarState;
 use ratatui::widgets::TableState;
 use std::{
@@ -51,6 +52,7 @@ pub struct App {
     pub graphs_bpf_program: Arc<Mutex<Option<BpfProgram>>>,
     sorted_column: Arc<Mutex<SortColumn>>,
     delay_seconds: u64,
+    pub socket: Option<Socket>,
 }
 
 pub struct PeriodMeasure {
@@ -149,6 +151,7 @@ impl App {
             graphs_bpf_program: Arc::new(Mutex::new(None)),
             sorted_column: Arc::new(Mutex::new(SortColumn::NoOrder)),
             delay_seconds,
+            socket: None,
         };
         // Default sort column is Total CPU % in descending order
         app.sort_column(SortColumn::Descending(6));
@@ -301,6 +304,7 @@ impl App {
         self.max_eps = 0;
         self.max_runtime = 0;
         *self.graphs_bpf_program.lock().unwrap() = None;
+        self.socket = None;
     }
 
     pub fn selected_program(&self) -> Option<BpfProgram> {

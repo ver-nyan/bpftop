@@ -42,7 +42,7 @@ pub fn round_to_first_non_zero(num: f64) -> f64 {
     (num * multiplier).round() / multiplier
 }
 
-pub fn program_type_as_str(program_type: &ProgramType) -> &'static str {
+pub const fn program_type_as_str(program_type: &ProgramType) -> &'static str {
     match program_type {
         ProgramType::Unspec => "Unspec",
         ProgramType::SocketFilter => "SocketFilter",

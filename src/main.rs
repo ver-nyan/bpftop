@@ -535,7 +535,12 @@ fn render_graphs(f: &mut Frame, app: &mut App, area: Rect) {
             ]),
         ];
 
-        attach_info_rows.extend(render_prog_attachments(bpf_program.id));
+        let socket = &mut app.socket;
+        attach_info_rows.extend(render_prog_attachments(
+            bpf_program.id,
+            bpf_program.bpf_type,
+            socket,
+        ));
     }
 
     let info_block = Block::default()
